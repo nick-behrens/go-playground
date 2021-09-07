@@ -1,0 +1,9 @@
+{
+  "generator-snap-go": {
+    "promptValues": {
+      "appname": "go-playground",
+      "vendor": true,
+      "codeowners": "@nick-behrens"
+    }
+  }
+}

@@ -1,0 +1,339 @@
+library "jenkins-library"
+def autoCancelled = false
+String cronString = ("${env.BRANCH_NAME}" == 'develop' ? '0 0 * * 1-5' : '')
+
+def helmEnvs = [""]
+def helmEnv = ""
+def directory = ''
+def gitRepoUrl = "https://github.com/snapdocs/go-playground"
+
+pipeline {
+    triggers {
+        cron("${cronString}") // nightly Mon-Fri from develop branch
+    }
+    options {}
+    environment {
+        NEXUS = credentials('nexus')
+        GITHUB_TOKEN = credentials('snapdocs-jenkins-token')
+        repository = "go-playground"
+        buildID = consulUtils.getTagNumber("go-playground")
+    }
+    agent {
+        kubernetes {
+            label "go-playground-build"
+            idleMinutes 5
+            yamlFile '.jenkins/sidecar-containers.yaml'
+        }
+    }
+    stages {
+        stage('git branch'){
+            steps {
+                script {
+                    gitBranch = sh(
+                        script: "echo ${env.BRANCH_NAME} | cut -d '/' -f2",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        stage('determine build cause') {
+            steps {
+                script {
+                    println "${branchIndexing()}"
+                    if(branchIndexing().toBoolean() == true) {
+                        autoCancelled = true
+                        currentBuild.description = 'Build Stopping: Branch is indexing.'
+                        error('Build Aborted')
+                        currentBuild.Result = 'SUCCESS'
+                    }
+                }
+            }
+        }
+
+        stage('go mod download') {
+            steps {
+                container('go16') {
+                    script {
+                        job = "${env.JOB_NAME}".replaceAll('/', '_')
+                        println "${job}"
+                        if (fileExists("/home/jenkins/agent/workspace/${job}/cache.tar.gz")) {
+                            println "${job} cache already downloaded"
+                        } else {
+                          //  go_mod_download()
+                          // ommitting download until recursion is fixed
+                          println "ho hum"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('go test + build') {
+            parallel {
+                stage('go => lint') {
+                    steps {
+                        script {
+                            dockerUtils.test(
+                                container: 'golangci',
+                                context: 'lint',
+                                failBuild: true,
+                                function: {
+                                    withCredentials([usernamePassword(credentialsId: 'snapdocs-jenkins-token', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USER')]) {
+                                        sh "git config --global url.\"https://${env.GIT_PASSWORD}:x-oauth-basic@github.com/snapdocs\".insteadOf \"https://github.com/snapdocs\""
+                                    }
+                                    sh "golangci-lint run --out-format checkstyle | tee lint.out"
+                                }
+                            )
+                        }
+                    }
+                }
+                stage('go => test') {
+                    steps {
+                        script {
+                            dockerUtils.test(
+                                container: 'go16',
+                                context: 'test',
+                                failBuild: true,
+                                function: {
+                                    withCredentials([usernamePassword(credentialsId: 'snapdocs-jenkins-token', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USER')]) {
+                                        sh "git config --global url.\"https://${env.GIT_PASSWORD}:x-oauth-basic@github.com/snapdocs\".insteadOf \"https://github.com/snapdocs\""
+                                    }
+                                    sh "go test -mod=readonly -race -coverprofile=coverage.out ./..."
+                                }
+                            )
+                        }
+                    }
+                }
+
+                stage('go => build') {
+                    steps {
+                        dockerUtils.test(
+                            container: 'docker',
+                            context: 'docker build and push',
+                            failBuild: true,
+                            function: {
+                                script {
+                                    dockerUtils.login('infrastructure')
+                                    commitHash = github.latestCommit()
+                                    newTag = "${env.BUILD_NUMBER}-${env.BRANCH_NAME}-${commitHash}"
+                                    withCredentials([usernamePassword(credentialsId: 'snapdocs-jenkins-token', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USER')]) {
+                                        def image = dockerUtils.build([
+                                            repository: repository,
+                                            buildID: buildID,
+                                            secondaryId: newTag,
+                                            dockerFile: 'build/Dockerfile',
+                                            buildArgs: [
+                                                "BUILD_NUMBER=${env.BUILD_NUMBER}",
+                                                "BUILD_COMMIT=${env.GIT_COMMIT}",
+                                                "GITHUB_TOKEN=${GIT_PASSWORD}"
+                                            ]
+                                        ])
+                                    }
+                                    dockerUtils.push(image)
+                                    dockerUtils.addTag(repo: 'go-playground', newTag: "${newTag}", tag: "${buildID}")
+                                    currentBuild.displayName = "Build Tag - ${buildID}"
+                                    currentBuild.description = "Commit hash - ${commitHash}"
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('quality scans') {
+            parallel {
+                stage('sonar => scan') {
+                    steps {
+                        script {
+                            dockerUtils.test(
+                                container: 'sonar',
+                                context: 'sonar',
+                                failBuild: true,
+                                function: {
+                                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                                        def prstring = "";
+                                        if (env.CHANGE_ID) {
+                                            prstring = "-Dsonar.pullrequest.key=${env.CHANGE_ID} -Dsonar.pullrequest.branch=${env.BRANCH_NAME} -Dsonar.pullrequest.base=${env.CHANGE_TARGET}"
+                                        }
+                                        sh """
+                                        sonar-scanner \
+                                            -Dsonar.projectKey=snapdocs:go-playground \
+                                            -Dsonar.sources=. \
+                                            -Dsonar.host.url=https://sonarqube.infra.snpd.io \
+                                            -Dsonar.login=${SONAR_TOKEN} \
+                                            -Dsonar.github.repository=snapdocs/go-playground \
+                                            -Dsonar.exclusions=**/*_test.go,**/*.xml,**/*.xsd \
+                                            -Dsonar.tests=. \
+                                            -Dsonar.test.inclusions=**/*_test.go \
+                                            -Dsonar.go.golangci-lint.reportPaths=lint.out \
+                                            -Dsonar.go.exclusions=**/*_test.go \
+                                            -Dsonar.go.coverage.reportPaths=coverage.out ${prstring}
+                                        """
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+                stage("twistlock scan") {
+                    when {
+                        beforeAgent true
+                        expression { env.BRANCH_NAME == 'develop' || env.BRANCH_NAME == 'main' }
+                    }
+                    steps {
+                        script {
+                            build job: 'twistlock-scan',
+                            wait: true,
+                            parameters: [
+                                string(name: 'repository', value: "go-playground"),
+                                string(name: 'tag', value: "${buildID}")
+                            ]
+                        }
+                    }
+                }
+                // stage('checkmarx') {}
+            }
+        }
+        stage('deploy') {
+            // run deploys only on the `develop` branch
+            when {
+                beforeAgent true
+                expression {
+                    env.BRANCH_NAME == 'develop'
+                }
+            }
+            steps {
+                script {
+                    Map parallelDeploys = [:]
+
+                    String[] namespaces = []
+                    String[] services = []
+
+                    namespaces.each { namespace ->
+                        services.each { service ->
+                            parallelDeploys["${service} -> ${namespace}"] = {
+                                build job: "go-playground_deploy",
+                                wait: true,
+                                parameters: [
+                                    string(name: 'appName', value: service),
+                                    string(name: 'namespace', value: namespace),
+                                    string(name: 'deployArgs', value: "--set docker.image.tag=${buildID}")
+                                ]
+                            }
+
+                        }
+                    }
+
+                    parallel parallelDeploys
+                }
+            }
+        }
+        stage('release') {
+            // release only on the `main` branch
+            when {
+                beforeAgent true
+                expression { return env.CHANGE_BRANCH ==~ /^release\/\d{4}\.\d{2}\.\d{2}/ }
+                }
+            steps {
+                script {
+                    Map parallelDeploys = [:]
+
+                    releaseNs = "${env.CHANGE_BRANCH}".replace('/','-').replace('.','-')
+                    String[] namespaces = ["${releaseNs}"]
+                    String[] services = []
+
+
+                    namespaces.each { namespace ->
+                        services.each { service ->
+                            parallelDeploys["${service} -> ${namespace}"] = {
+                                build job: "go-playground_deploy",
+                                wait: true,
+                                parameters: [
+                                    string(name: 'appName', value: service),
+                                    string(name: 'namespace', value: namespace),
+                                    string(name: 'deployArgs', value: "--set docker.image.tag=${buildID}")
+                                ]
+                            }
+                        }
+                    }
+
+                parallel parallelDeploys
+                }
+            }
+        }
+        stage('production') {
+            // release only on the `main` branch
+            when {
+                beforeAgent true
+                expression {
+                    env.BRANCH_NAME == 'main'
+                }
+            }
+            steps {
+                script {
+                    Map parallelDeploys = [:]
+
+                    String[] namespaces = []
+                    String[] services = []
+
+                    namespaces.each { namespace ->
+                        services.each { service ->
+                            parallelDeploys["${service} -> ${namespace}"] = {
+                                build job: "go-playground_deploy",
+                                wait: true,
+                                parameters: [
+                                    string(name: 'appName', value: service),
+                                    string(name: 'namespace', value: namespace),
+                                    string(name: 'deployArgs', value: "--set docker.image.tag=${buildID}")
+                                ]
+                            }
+                        }
+                    }
+
+                    parallel parallelDeploys
+                }
+            }
+        }
+    }
+    post {
+        success {
+            container('go16') {
+                script {
+                    s3cache.save(name: "go-playground", files: ['/go/pkg/mod'], directory: "/go/pkg/mod")
+                }
+            }
+        }
+        always {
+            script {
+                currentBuild.result = currentBuild.result ?: "SUCCESS"
+                if(currentBuild.result == 'FAILURE') {
+                slack(currentBuild.result, "go-playground-cicd", " - go-playground -> build")
+                }
+            }
+        }
+    }
+}
+
+def go_mod_download() {
+    s3cache.restore(name: "go-playground", directory: "/go/pkg/mod")
+    sh 'apt-get update && apt-get install yarn -y'
+    withCredentials([usernamePassword(credentialsId: 'snapdocs-jenkins-token', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USER')]) {
+        sh "git config --global url.\"https://${env.GIT_PASSWORD}:x-oauth-basic@github.com/snapdocs\".insteadOf \"https://github.com/snapdocs\""
+    }
+    sh 'go mod download'
+}
+
+def branchIndexing () {
+  def isBranchIndexing = false
+    if (!currentBuild.rawBuild) {
+      return true
+    }
+
+  currentBuild.rawBuild.getCauses().each { cause ->
+    if (cause instanceof jenkins.branch.BranchIndexingCause) {
+      isBranchIndexing = true
+    }
+  }
+  return isBranchIndexing
+}
