@@ -96,7 +96,7 @@ func multipleChannelProducers() {
 	messages := make(chan string)
 
 	// We are going to make two creators and a single consumer.
-	// These will need the main method to wait for it to finish, that is what the wg WaitGroup is for.
+	// These will need the main method to wait for it to finish, that is what the subroutine WaitGroup is for.
 	var subroutine sync.WaitGroup
 	var prouducer sync.WaitGroup
 
