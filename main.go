@@ -94,6 +94,16 @@ func main() {
 	// connectAndRunQueryWithGoCommon()
 
 	// getDatabaseAndRunQueries()
+
+	// testDatadogAndAirbrakes()
+
+	// simpleChannelExample()
+
+	// channelsToPassDataBetweenRoutines()
+
+	// channelsToPassDataAndEndFunction()
+
+	multipleChannelProducers()
 }
 
 func getDatabaseAndRunQueries() {
